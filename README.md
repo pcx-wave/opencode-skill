@@ -34,7 +34,7 @@ When you type `/opencode <instruction>` in Claude Code, this skill:
 ## Installation
 
 ```bash
-git clone <your-repo-url> && cd opencode-skill
+git clone https://github.com/pcx-wave/opencode-skill && cd opencode-skill
 mkdir -p ~/tools ~/.claude/skills/opencode ~/.claude/skills/opencodeon ~/.claude/skills/opencodeoff ~/.claude/skills/opencodestatus
 ln -sf "$(pwd)/tools/opencode-delegate" ~/tools/opencode-delegate
 chmod +x ~/tools/opencode-delegate
