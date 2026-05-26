@@ -34,14 +34,44 @@ When you type `/opencode <instruction>` in Claude Code, this skill:
 ## Installation
 
 ```bash
-git clone https://github.com/pcx-wave/opencode-skill && cd opencode-skill
-mkdir -p ~/tools ~/.claude/skills/opencode ~/.claude/skills/opencodeon ~/.claude/skills/opencodeoff ~/.claude/skills/opencodestatus
+git clone https://github.com/pcx-wave/opencode-skill.git && cd opencode-skill && mkdir -p ~/tools ~/.claude/skills/opencode ~/.claude/skills/opencodeon ~/.claude/skills/opencodeoff ~/.claude/skills/opencodestatus ~/.claude/skills/opencode-model-pick ~/.claude/skills/opencode-model-clear && ln -sf "$(pwd)/tools/opencode-delegate" ~/tools/opencode-delegate && ln -sf "$(pwd)/tools/delegate-report" ~/tools/delegate-report && chmod +x ~/tools/opencode-delegate ~/tools/delegate-report && ln -sf "$(pwd)/SKILL.md" ~/.claude/skills/opencode/SKILL.md && ln -sf "$(pwd)/OPENCODEON.md" ~/.claude/skills/opencodeon/SKILL.md && ln -sf "$(pwd)/OPENCODEOFF.md" ~/.claude/skills/opencodeoff/SKILL.md && ln -sf "$(pwd)/OPENCODESTATUS.md" ~/.claude/skills/opencodestatus/SKILL.md && ln -sf "$(pwd)/OPENCODEMODELPICK.md" ~/.claude/skills/opencode-model-pick/SKILL.md && ln -sf "$(pwd)/OPENCODEMODELCLEAR.md" ~/.claude/skills/opencode-model-clear/SKILL.md
+```
+
+### Step-by-step
+
+```bash
+# 1. Clone this repo
+git clone https://github.com/pcx-wave/opencode-skill.git
+cd opencode-skill
+
+# 2. Install the scripts (symlinks — stay in sync with git pull)
+mkdir -p ~/tools
 ln -sf "$(pwd)/tools/opencode-delegate" ~/tools/opencode-delegate
-chmod +x ~/tools/opencode-delegate
+ln -sf "$(pwd)/tools/delegate-report" ~/tools/delegate-report
+chmod +x ~/tools/opencode-delegate ~/tools/delegate-report
+
+# 3. Install the skills for Claude Code
+mkdir -p ~/.claude/skills/opencode ~/.claude/skills/opencodeon ~/.claude/skills/opencodeoff \
+         ~/.claude/skills/opencodestatus ~/.claude/skills/opencode-model-pick ~/.claude/skills/opencode-model-clear
 ln -sf "$(pwd)/SKILL.md" ~/.claude/skills/opencode/SKILL.md
 ln -sf "$(pwd)/OPENCODEON.md" ~/.claude/skills/opencodeon/SKILL.md
 ln -sf "$(pwd)/OPENCODEOFF.md" ~/.claude/skills/opencodeoff/SKILL.md
 ln -sf "$(pwd)/OPENCODESTATUS.md" ~/.claude/skills/opencodestatus/SKILL.md
+ln -sf "$(pwd)/OPENCODEMODELPICK.md" ~/.claude/skills/opencode-model-pick/SKILL.md
+ln -sf "$(pwd)/OPENCODEMODELCLEAR.md" ~/.claude/skills/opencode-model-clear/SKILL.md
+
+# 4. (Optional) Enable auto-mode — Claude delegates all code tasks automatically
+#    without requiring /opencode each time. Toggle with /opencodeon and /opencodeoff.
+grep -q "opencode auto-mode" ~/.claude/CLAUDE.md 2>/dev/null || cat >> ~/.claude/CLAUDE.md << 'EOF'
+
+# opencode auto-mode
+At the start of every user request that involves writing, editing, or fixing code:
+1. Run `test -f ~/.local/share/opencode-auto.flag` (silent, no output to user).
+2. If the flag exists → automatically invoke the `opencode` skill exactly as if the user had typed `/opencode <their full instruction>`. Do NOT ask first, do NOT explain — just delegate.
+3. If the flag is absent → proceed normally.
+
+The flag is toggled by `/opencodeon` and `/opencodeoff`.
+EOF
 ```
 
 ### Verify the install
@@ -54,6 +84,16 @@ opencode --version
 ~/tools/opencode-delegate /tmp "Say hello in one sentence." 60
 # Should print: [opencode] Hello! ...
 ```
+
+### Updating
+
+Because the install uses symlinks, a `git pull` is all you need:
+
+```bash
+cd ~/opencode-skill && git pull
+```
+
+`~/tools/opencode-delegate` and all skill files are automatically up to date — no re-copy needed.
 
 ---
 
