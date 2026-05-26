@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+# opencode-delegate — Launch opencode CLI headlessly, parse JSON events, report diff
+# Usage: opencode-delegate <workdir> <prompt> [timeout-secs] [model]
+#
+# Delegates a coding task to opencode CLI via its non-interactive `run` mode.
+# opencode CLI works in a plain pipe — no pseudo-TTY needed (like gemini, unlike vibe).
+# We cd into workdir and pass the prompt via command-line args.
+#
+# LIMITS:
+#   - No --max-turns:  timeout is the only runaway-control lever (like gemini)
+#   - Requires --dangerously-skip-permissions: all tools are auto-approved
+#   - Free models may have queue/rate-limit delays
+#
+# RUN LOG:
+#   Appends one JSONL entry to ~/.local/share/delegate-runs.jsonl after each run.
+#   Fields: ts, delegate, project, prompt_words, model, timeout_secs, exit_code,
+#           timed_out, tool_calls, files_changed, syntax_errors, duration_secs,
+#           tokens_in, tokens_out, tokens_total, cost_usd.
+
+WORKDIR="${1:?Usage: opencode-delegate <workdir> <prompt> [timeout-secs] [model]}"
+PROMPT="${2:?Prompt required}"
+TIMEOUT_SECS="${3:-300}"
+MODEL="${4:-opencode/deepseek-v4-flash-free}"
+
+# Model override: /opencode-model-pick writes model string to this flag file.
+OPENCODE_MODEL_FLAG="$HOME/.local/share/opencode-model.flag"
+if [ -f "$OPENCODE_MODEL_FLAG" ]; then
+  MODEL=$(tr -d '[:space:]' < "$OPENCODE_MODEL_FLAG")
+fi
+
+if [ ! -d "$WORKDIR" ]; then
+  echo "ERROR: workdir '$WORKDIR' does not exist" >&2
+  exit 1
+fi
+
+cd "$WORKDIR" || exit 1
+START_NS=$(date +%s%N)
+PROMPT_WORDS=$(printf '%s' "$PROMPT" | wc -w | tr -d ' ')
+GIT_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "no-git")
+FILES_BEFORE=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
+
+echo "=== OPENCODE START ==="
+echo "Workdir : $WORKDIR"
+echo "Model   : $MODEL"
+echo "Timeout : ${TIMEOUT_SECS}s"
+echo "Prompt  : ${PROMPT:0:120}..."
+echo "======================"
+
+# Write prompt to a temp file for consistent handling; content is loaded into
+# a double-quoted variable before passing as a positional arg to opencode run.
+PROMPT_FILE=$(mktemp /tmp/opencode-prompt-XXXXXX.txt)
+
+# Stats handoff file: Python parser writes JSON here; bash reads it for the log.
+DELEGATE_STATS_FILE=$(mktemp /tmp/delegate-stats-XXXXXX.json)
+printf '{}' > "$DELEGATE_STATS_FILE"
+export DELEGATE_STATS_FILE
+
+trap 'rm -f "$PROMPT_FILE" "$DELEGATE_STATS_FILE" "$SYNTAX_COUNT_FILE" /tmp/opencode-syntax-err.txt' EXIT
+printf '%s' "$PROMPT" > "$PROMPT_FILE"
+
+PROMPT_CONTENT=$(cat "$PROMPT_FILE")
+
+# Run opencode in non-interactive mode, streaming JSON events.
+# opencode works fine in a plain pipe — no pseudo-TTY needed.
+export OPENCODE_RUN_MODE="opencode-delegate"
+timeout "$TIMEOUT_SECS" opencode run "$PROMPT_CONTENT" \
+  --format json \
+  --dangerously-skip-permissions \
+  --model "$MODEL" \
+  --dir "$WORKDIR" \
+  2>&1 | python3 -c "
+import sys, json, os
+
+tool_calls = 0
+model_name = '$MODEL'
+tokens_total = 0
+tokens_in = 0
+tokens_out = 0
+tokens_reasoning = 0
+tokens_cache_read = 0
+tokens_cache_write = 0
+cost_usd = 0.0
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+
+    t = ev.get('type', '')
+
+    if t == 'step_start':
+        pass
+
+    elif t == 'tool_use':
+        part = ev.get('part', {})
+        tool = part.get('tool', '')
+        state = part.get('state', {})
+        inp = state.get('input', {}) if isinstance(state, dict) else {}
+        status = state.get('status', '') if isinstance(state, dict) else ''
+
+        # opencode emits multiple tool_use events per call as state transitions
+        # (pending → running → completed/error); only act on terminal states.
+        if status not in ('completed', 'error'):
+            continue
+
+        tool_calls += 1
+
+        if tool == 'read':
+            path = inp.get('filePath', '')
+            print(f'  [read]   {path or tool}', flush=True)
+        elif tool == 'edit':
+            path = inp.get('filePath', '')
+            meta = state.get('metadata', {}) if isinstance(state, dict) else {}
+            filediff = meta.get('filediff', {}) if isinstance(meta, dict) else {}
+            additions = filediff.get('additions', 0) if isinstance(filediff, dict) else 0
+            deletions = filediff.get('deletions', 0) if isinstance(filediff, dict) else 0
+            diff_str = f'(+{additions}/-{deletions})' if additions or deletions else ''
+            print(f'  [edit]   {path}  {diff_str}', flush=True)
+        elif tool == 'write':
+            path = inp.get('filePath', '')
+            print(f'  [write]  {path or tool}', flush=True)
+        elif tool in ('grep', 'search'):
+            pattern = inp.get('pattern', '') or inp.get('query', '')
+            print(f'  [search] {pattern[:80] or tool}', flush=True)
+        elif tool == 'bash':
+            cmd = inp.get('command', '') or inp.get('cmd', '')
+            print(f'  [shell]  {cmd[:100] or tool}', flush=True)
+        elif tool == 'glob':
+            pattern = inp.get('pattern', '')
+            print(f'  [tool]   glob: {pattern}', flush=True)
+        elif tool == 'todowrite':
+            print(f'  [tool]   todowrite', flush=True)
+        elif tool == 'skill':
+            print(f'  [tool]   skill: {inp.get(\"name\", \"\")}', flush=True)
+        else:
+            print(f'  [tool]   {tool}', flush=True)
+
+        if status == 'error':
+            output = state.get('output', '') if isinstance(state, dict) else ''
+            if output:
+                print(f'  [WARN]   {output[:120]}', flush=True)
+
+    elif t == 'text':
+        part = ev.get('part', {})
+        text = part.get('text', '')
+        if text and text.strip():
+            print(f'  [opencode] {text.strip()[:400]}', flush=True)
+
+    elif t == 'step_finish':
+        part = ev.get('part', {})
+        step_tokens = part.get('tokens', {}) if isinstance(part, dict) else {}
+        step_cost = part.get('cost', 0)
+        if isinstance(step_tokens, dict):
+            tokens_total += step_tokens.get('total', 0) or 0
+            tokens_in += step_tokens.get('input', 0) or 0
+            tokens_out += step_tokens.get('output', 0) or 0
+            tokens_reasoning += step_tokens.get('reasoning', 0) or 0
+            cache = step_tokens.get('cache', {}) or {}
+            tokens_cache_read += cache.get('read', 0) if isinstance(cache, dict) else 0
+            tokens_cache_write += cache.get('write', 0) if isinstance(cache, dict) else 0
+        if isinstance(step_cost, (int, float)):
+            cost_usd += step_cost
+
+    elif t == 'error':
+        err = ev.get('error', {})
+        msg = ''
+        if isinstance(err, dict):
+            data = err.get('data', {}) or {}
+            msg = data.get('message', '') if isinstance(data, dict) else str(err)
+        if not msg:
+            msg = str(err)
+        print(f'  [ERROR]  {msg[:200]}', flush=True)
+
+print(f'Tool calls: {tool_calls}')
+
+# Print token/cost summary
+if tokens_total > 0:
+    cached = tokens_cache_read + tokens_cache_write
+    cache_str = f', {cached} cached' if cached else ''
+    print(f'OpenCode tokens: {tokens_total:,}  ({tokens_in:,} in + {tokens_out:,} out{cache_str})  |  ~\${cost_usd:.6f}')
+else:
+    print('(no token data available)')
+
+sf = os.environ.get('DELEGATE_STATS_FILE', '')
+if sf:
+    try:
+        payload = {
+            'tool_calls': tool_calls,
+            'model': model_name,
+            'tokens_in': tokens_in,
+            'tokens_out': tokens_out,
+            'tokens_total': tokens_total,
+            'tokens_reasoning': tokens_reasoning,
+            'tokens_cache_read': tokens_cache_read,
+            'tokens_cache_write': tokens_cache_write,
+            'cost_usd': round(cost_usd, 6),
+        }
+        with open(sf, 'w') as wf:
+            json.dump(payload, wf)
+    except Exception:
+        pass
+"
+OPENCODE_EXIT=${PIPESTATUS[0]}
+
+echo ""
+if [ "$OPENCODE_EXIT" -eq 124 ]; then
+  echo "=== OPENCODE TIMEOUT (>${TIMEOUT_SECS}s) — killed ==="
+elif [ "$OPENCODE_EXIT" -eq 0 ]; then
+  echo "=== OPENCODE DONE (exit: 0) ==="
+else
+  echo "=== OPENCODE DONE (exit: $OPENCODE_EXIT) ==="
+fi
+
+# ── Post-run file tracking ───────────────────────────────────────────────────
+FILES_AFTER=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
+CHANGED=$(comm -13 <(echo "$FILES_BEFORE" | sort) <(echo "$FILES_AFTER" | sort) 2>/dev/null)
+FILES_CHANGED_COUNT=$(printf '%s\n' "$CHANGED" | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+
+SYNTAX_COUNT_FILE=$(mktemp /tmp/opencode-syntax-count-XXXXXX.txt)
+echo 0 > "$SYNTAX_COUNT_FILE"
+export DELEGATE_CHANGED="$CHANGED"
+export SYNTAX_COUNT_FILE
+
+python3 << 'PYSYNTAX'
+import os, shutil, subprocess
+
+changed = [f for f in os.environ.get('DELEGATE_CHANGED', '').splitlines() if f.strip()]
+errors  = 0
+checked = 0
+
+def has(cmd):
+    return shutil.which(cmd) is not None
+
+def check(cmd, label, cwd=None):
+    global errors, checked
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    checked += 1
+    if r.returncode != 0:
+        errors += 1
+        msg = (r.stderr or r.stdout).strip().split('\n')[0][:120]
+        print(f'  [SYNTAX ERROR] {label}: {msg}')
+
+for f in changed:
+    if not os.path.isfile(f):
+        continue
+    if   f.endswith('.py'):
+        check(['python3', '-m', 'py_compile', f], f)
+    elif f.endswith(('.js', '.mjs', '.cjs')) and has('node'):
+        check(['node', '--check', f], f)
+    elif f.endswith('.rb') and has('ruby'):
+        check(['ruby', '-c', f], f)
+    elif f.endswith(('.sh', '.bash')):
+        check(['bash', '-n', f], f)
+    elif f.endswith('.php') and has('php'):
+        check(['php', '-l', f], f)
+    elif f.endswith('.json'):
+        check(['python3', '-c', 'import json,sys;json.load(open(sys.argv[1]))', f], f)
+
+# Project-level checks
+live = [f for f in changed if os.path.isfile(f)]
+if any(f.endswith(".go") for f in live) and has("go"):
+    check(["go", "vet", "./..."], "go vet")
+if any(f.endswith(".rs") for f in live) and has("cargo"):
+    check(["cargo", "check", "--quiet"], "cargo check")
+if any(f.endswith((".ts", ".tsx")) for f in live):
+    if has("tsc") and os.path.isfile("tsconfig.json"):
+        check(["tsc", "--noEmit", "--skipLibCheck"], "tsc --noEmit")
+    else:
+        print("  [SKIP] tsc — no tsconfig.json found, TypeScript not checked")
+
+if checked > 0:
+    if errors == 0:
+        print(f'=== SYNTAX OK ({checked} check(s)) ===')
+    else:
+        print(f'=== SYNTAX ERRORS: {errors} in {checked} check(s) — fix before committing ===')
+
+cf = os.environ.get('SYNTAX_COUNT_FILE', '')
+if cf:
+    with open(cf, 'w') as fh:
+        fh.write(str(errors))
+PYSYNTAX
+
+TOTAL_ERRORS=$(cat "$SYNTAX_COUNT_FILE" 2>/dev/null || echo 0)
+rm -f "$SYNTAX_COUNT_FILE"
+
+# ── Git summary ────────────────────────────────────────────────────────────────
+GIT_AFTER=$(git rev-parse HEAD 2>/dev/null || echo "no-git")
+
+if [ "$GIT_BEFORE" != "$GIT_AFTER" ]; then
+  echo ""
+  echo "=== COMMITS CREATED ==="
+  git log "$GIT_BEFORE".."$GIT_AFTER" --oneline
+  echo ""
+  echo "=== DIFF STAT ==="
+  git diff "$GIT_BEFORE".."$GIT_AFTER" --stat
+else
+  echo ""
+  echo "=== UNCOMMITTED CHANGES ==="
+  git diff --stat 2>/dev/null
+  git status --short 2>/dev/null
+fi
+
+# ── Run log ────────────────────────────────────────────────────────────────────
+END_NS=$(date +%s%N)
+FILES_CHANGED_COUNT=${FILES_CHANGED_COUNT:-0}
+TOTAL_ERRORS=${TOTAL_ERRORS:-0}
+
+export DELEGATE_NAME="opencode"
+export DELEGATE_WORKDIR="$WORKDIR"
+export DELEGATE_EXIT="$OPENCODE_EXIT"
+export DELEGATE_TIMEOUT="$TIMEOUT_SECS"
+export DELEGATE_PROMPT_WORDS="$PROMPT_WORDS"
+export DELEGATE_MODEL="$MODEL"
+export DELEGATE_FILES_CHANGED="$FILES_CHANGED_COUNT"
+export DELEGATE_SYNTAX_ERRORS="$TOTAL_ERRORS"
+export DELEGATE_START_NS="$START_NS"
+export DELEGATE_END_NS="$END_NS"
+
+python3 << 'PYLOG'
+import json, os
+from pathlib import Path
+from datetime import datetime, timezone
+
+LOG = Path.home() / '.local' / 'share' / 'delegate-runs.jsonl'
+LOG.parent.mkdir(parents=True, exist_ok=True)
+
+sf = os.environ.get('DELEGATE_STATS_FILE', '')
+stats = {}
+if sf:
+    try:
+        stats = json.loads(Path(sf).read_text())
+    except Exception:
+        pass
+
+start_ns = int(os.environ.get('DELEGATE_START_NS', 0) or 0)
+end_ns   = int(os.environ.get('DELEGATE_END_NS',   0) or 0)
+duration = round((end_ns - start_ns) / 1e9, 1) if start_ns and end_ns else 0
+
+def _int(val, default=0):
+    try:
+        return int(str(val).strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return default
+
+entry = {
+    'ts':            datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'delegate':      os.environ.get('DELEGATE_NAME', 'opencode'),
+    'workdir':       os.environ.get('DELEGATE_WORKDIR', ''),
+    'project':       os.path.basename(os.environ.get('DELEGATE_WORKDIR', '')),
+    'prompt_words':  _int(os.environ.get('DELEGATE_PROMPT_WORDS', 0)),
+    'model':         os.environ.get('DELEGATE_MODEL', ''),
+    'timeout_secs':  _int(os.environ.get('DELEGATE_TIMEOUT', 0)),
+    'exit_code':     _int(os.environ.get('DELEGATE_EXIT', 0)),
+    'timed_out':     os.environ.get('DELEGATE_EXIT') == '124',
+    'files_changed':       _int(os.environ.get('DELEGATE_FILES_CHANGED', 0)),
+    'syntax_errors':       _int(os.environ.get('DELEGATE_SYNTAX_ERRORS', 0)),
+    'duration_secs':       duration,
+}
+entry.update(stats)
+
+# Claude Sonnet 4.6 equivalent cost for savings comparison
+ti = entry.get('tokens_in', 0)
+to = entry.get('tokens_out', 0)
+entry['cost_claude_eq'] = round((ti * 3.0 + to * 15.0) / 1_000_000, 6)
+
+# True when opencode ran tool calls but wrote nothing
+entry['wrote_nothing'] = (
+    entry.get('files_changed', 0) == 0
+    and entry.get('tool_calls', 0) >= 3
+    and entry.get('exit_code', 0) == 0
+)
+
+with open(LOG, 'a') as f:
+    f.write(json.dumps(entry) + '\n')
+
+tok = entry.get('tokens_total', '?')
+saved = entry['cost_claude_eq'] - entry.get('cost_usd', 0)
+saved_str = f', saved ~${saved:.4f} vs Claude' if saved > 0 else ''
+print(f'[log] → {LOG}  ({tok} tokens, exit {entry["exit_code"]}, {duration}s{saved_str})')
+PYLOG
+
+exit $OPENCODE_EXIT
