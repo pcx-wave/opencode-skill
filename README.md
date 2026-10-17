@@ -24,9 +24,10 @@ When you type `/opencode <instruction>` in Claude Code, this skill:
 
 ## Prerequisites
 
-- [OpenCode CLI](https://opencode.ai) installed (`opencode --version`)
+- [OpenCode CLI](https://opencode.ai) v1 or v2 installed (`opencode --version`; the free tier needs ≥1.18.0)
 - [Claude Code](https://claude.ai/code) with skills enabled
 - `python3` available (for the streaming parser and syntax checks)
+- GNU `timeout` available — on macOS: `brew install coreutils`
 - A git repository to work in
 
 ---
@@ -136,7 +137,9 @@ Claude Code
             └─ ~/tools/opencode-delegate <workdir> <prompt> [timeout] [model]
                  ├─ writes prompt to temp file (avoids shell injection)
                  ├─ runs: opencode run <prompt> --format json
-                 │   --dangerously-skip-permissions --model <model> --dir <workdir>
+                 │   --model <model> + version-specific flags (run from inside <workdir>)
+                 │   └─ --dangerously-skip-permissions (v1 ≤1.15) or --auto (v1.19+, v2),
+                 │      plus --dir <workdir> when supported (detected from `opencode run --help`)
                  │   └─ no pseudo-TTY needed (unlike Vibe)
                  ├─ pipes JSON events through Python parser
                  │   └─ handles: step_start / tool_use / text / step_finish / error
@@ -167,7 +170,7 @@ OpenCode's internal tool calls consume **OpenCode tokens**, not Claude tokens.
 Claude only receives the compressed final output (~200-800 tokens/run).
 
 **Pricing depends on the model used:**
-- `opencode/deepseek-v4-flash-free` — **free**, no API key needed (may have queue delays)
+- `opencode/glm-5.3-flash-free` — **free**, no API key needed (may have queue delays)
 - `google/gemini-2.5-flash` — requires `GOOGLE_GENERATIVE_AI_API_KEY` env var
 
 Real token counts and cost are printed after every run and appended to the run log.
@@ -179,9 +182,10 @@ Real token counts and cost are printed after every run and appended to the run l
 | Limitation | Detail |
 |-----------|--------|
 | No `--max-turns` | Timeout is the only runaway control |
-| `--dangerously-skip-permissions` | All tools auto-approved (safe with post-run review) |
+| `--auto` / `--dangerously-skip-permissions` (v1 ≤1.15) | All tools auto-approved (safe with post-run review); flag auto-detected |
 | Free model delays | May have queue during peak usage |
-| No `--workdir` flag | Script `cd`s into workdir instead |
+| No `--dir` flag in v2 | Script `cd`s into workdir (v1 also gets `--dir`) |
+| Needs GNU `timeout` | Not in macOS by default — `brew install coreutils` |
 
 ---
 

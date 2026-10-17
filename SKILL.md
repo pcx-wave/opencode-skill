@@ -70,17 +70,17 @@ Hard constraints — not config options.
 ### 1. No `--max-turns` flag
 **Timeout is the only runaway-control lever.** Set timeouts conservatively and decompose tasks.
 
-### 2. `--dangerously-skip-permissions`
-Passed automatically by the delegate script — all tool calls auto-approved. Review the git diff afterwards.
+### 2. Auto-approved permissions (flags auto-detected)
+The delegate script reads `opencode run --help` and passes `--dangerously-skip-permissions` (v1 ≤1.15) or `--auto` (v1.19+, v2), plus `--dir <workdir>` when supported (v1 only) — all tool calls auto-approved. Review the git diff afterwards. The header's `CLI     :` line shows the detected version and flags. The free tier needs OpenCode ≥1.18.0.
 
-### 3. `--dir` flag
-Passed automatically by the delegate script. Sets the working directory for OpenCode.
+### 3. Workdir and `timeout`
+The delegate script `cd`s into the workdir (v2 has no `--dir`). Requires GNU `timeout` (macOS: `brew install coreutils`).
 
 ### 4. No pseudo-TTY needed
 Plain pipe — no `script -q -c` wrapper required.
 
 ### 5. Free model queue delays
-`opencode/deepseek-v4-flash-free` — no API key cost; may queue during peak usage.
+`opencode/glm-5.3-flash-free` — no API key cost; may queue during peak usage.
 
 ### 6. Orchestration chain — 5 failure points
 
@@ -199,7 +199,7 @@ VERIFY: grep for "datetime.date" in app.py and confirm it exists.
 | `workdir`      | —       | Absolute path, must exist |
 | `prompt`       | —       | Self-contained task description |
 | `timeout-secs` | `300`   | Wall-clock kill timer |
-| `model`        | `opencode/deepseek-v4-flash-free` | OpenCode model string |
+| `model`        | `opencode/glm-5.3-flash-free` | OpenCode model string |
 
 **Recommended timeouts:**
 - Explore only: `120`
@@ -207,7 +207,7 @@ VERIFY: grep for "datetime.date" in app.py and confirm it exists.
 - Medium change (2–3 files): `300`
 
 **Model selection:**
-- `opencode/deepseek-v4-flash-free` (default) — free, no API key needed, may have queue delays
+- `opencode/glm-5.3-flash-free` (default) — free, no API key needed, may have queue delays
 - `google/gemini-2.5-flash` — cheap, fast (requires `GOOGLE_GENERATIVE_AI_API_KEY`)
 
 **Examples:**
@@ -228,7 +228,8 @@ The script prints live:
 ```
 === OPENCODE START ===
 Workdir : /path/to/project
-Model   : opencode/deepseek-v4-flash-free
+Model   : opencode/glm-5.3-flash-free
+CLI     : opencode v2.0.32 (--auto)
 Timeout : 300s
 Prompt  : Stack: Python/Flask. File: app.py ...
 ======================
@@ -236,7 +237,7 @@ Prompt  : Stack: Python/Flask. File: app.py ...
   [edit]   app.py  (+2/-1)
   [opencode] Done. Converted date to datetime.date in fetch_data().
 Tool calls: 3
-OpenCode tokens: 4,800  (4,600 in + 200 out)  |  ~$0.000000
+OpenCode tokens: 4,800  (4,600 in + 200 out)  |  ~$X.XXXXXX
 === OPENCODE DONE (exit: 0) ===
 === SYNTAX OK (1 file(s) checked) ===
 
@@ -361,8 +362,7 @@ The shared `~/tools/delegate-report` script can query all runs across delegates.
 cat ~/.local/share/delegate-runs.jsonl | python3 -m json.tool | less
 
 # Total cost
-jq -r '.cost_usd' ~/.local/share/delegate-runs.jsonl \
-  | awk '{sum+=$1} END {printf "Total: $%.4f\n", sum}'
+jq -rs '"Total: $" + (map(.cost_usd // 0) | add | tostring)' ~/.local/share/delegate-runs.jsonl
 ```
 
 ---

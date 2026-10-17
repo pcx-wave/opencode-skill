@@ -8,7 +8,9 @@
 #
 # LIMITS:
 #   - No --max-turns:  timeout is the only runaway-control lever (like gemini)
-#   - Requires --dangerously-skip-permissions: all tools are auto-approved
+#   - Permissions auto-approved: --auto or --dangerously-skip-permissions (older v1),
+#     detected from `opencode run --help`
+#   - Requires GNU `timeout` (macOS: brew install coreutils)
 #   - Free models may have queue/rate-limit delays
 #
 # RUN LOG:
@@ -20,7 +22,7 @@
 WORKDIR="${1:?Usage: opencode-delegate <workdir> <prompt> [timeout-secs] [model]}"
 PROMPT="${2:?Prompt required}"
 TIMEOUT_SECS="${3:-300}"
-MODEL="${4:-opencode/deepseek-v4-flash-free}"
+MODEL="${4:-opencode/glm-5.3-flash-free}"
 
 # Model override: /opencode-model-pick writes model string to this flag file.
 OPENCODE_MODEL_FLAG="$HOME/.local/share/opencode-model.flag"
@@ -34,6 +36,21 @@ if [ ! -d "$WORKDIR" ]; then
 fi
 
 cd "$WORKDIR" || exit 1
+
+# Detect run flags from `opencode run --help` — they changed within v1, not at v2:
+#   <=1.15: --dangerously-skip-permissions, --dir   1.19: --auto, --dir   2.x: --auto only
+OC_VERSION=$(opencode --version 2>/dev/null | head -1)
+OC_HELP=$(opencode run --help 2>&1)
+OC_FLAGS=()
+if printf '%s' "$OC_HELP" | grep -q -- '--dangerously-skip-permissions'; then
+  OC_FLAGS+=(--dangerously-skip-permissions)
+else
+  OC_FLAGS+=(--auto)
+fi
+if printf '%s' "$OC_HELP" | grep -q -- '--dir'; then
+  OC_FLAGS+=(--dir "$WORKDIR")
+fi
+
 START_NS=$(date +%s%N)
 PROMPT_WORDS=$(printf '%s' "$PROMPT" | wc -w | tr -d ' ')
 GIT_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "no-git")
@@ -42,6 +59,7 @@ SENTINEL=$(mktemp /tmp/opencode-sentinel-XXXXXX)
 echo "=== OPENCODE START ==="
 echo "Workdir : $WORKDIR"
 echo "Model   : $MODEL"
+echo "CLI     : ${OC_VERSION:-unknown} (${OC_FLAGS[*]})"
 echo "Timeout : ${TIMEOUT_SECS}s"
 echo "Prompt  : ${PROMPT:0:120}..."
 echo "======================"
@@ -65,9 +83,8 @@ PROMPT_CONTENT=$(cat "$PROMPT_FILE")
 export OPENCODE_RUN_MODE="opencode-delegate"
 timeout "$TIMEOUT_SECS" opencode run "$PROMPT_CONTENT" \
   --format json \
-  --dangerously-skip-permissions \
+  "${OC_FLAGS[@]}" \
   --model "$MODEL" \
-  --dir "$WORKDIR" \
   2>&1 | python3 -c "
 import sys, json, os
 
@@ -88,6 +105,7 @@ for raw in sys.stdin:
     try:
         ev = json.loads(line)
     except json.JSONDecodeError:
+        print(f'  [raw]    {line[:200]}', flush=True)
         continue
 
     t = ev.get('type', '')
@@ -110,10 +128,10 @@ for raw in sys.stdin:
         tool_calls += 1
 
         if tool == 'read':
-            path = inp.get('filePath', '')
+            path = inp.get('filePath') or inp.get('path', '')
             print(f'  [read]   {path or tool}', flush=True)
         elif tool == 'edit':
-            path = inp.get('filePath', '')
+            path = inp.get('filePath') or inp.get('path', '')
             meta = state.get('metadata', {}) if isinstance(state, dict) else {}
             filediff = meta.get('filediff', {}) if isinstance(meta, dict) else {}
             additions = filediff.get('additions', 0) if isinstance(filediff, dict) else 0
@@ -121,7 +139,7 @@ for raw in sys.stdin:
             diff_str = f'(+{additions}/-{deletions})' if additions or deletions else ''
             print(f'  [edit]   {path}  {diff_str}', flush=True)
         elif tool == 'write':
-            path = inp.get('filePath', '')
+            path = inp.get('filePath') or inp.get('path', '')
             print(f'  [write]  {path or tool}', flush=True)
         elif tool in ('grep', 'search'):
             pattern = inp.get('pattern', '') or inp.get('query', '')
@@ -155,7 +173,11 @@ for raw in sys.stdin:
         step_tokens = part.get('tokens', {}) if isinstance(part, dict) else {}
         step_cost = part.get('cost', 0)
         if isinstance(step_tokens, dict):
-            tokens_total += step_tokens.get('total', 0) or 0
+            total = step_tokens.get('total', 0) or 0
+            if total:
+                tokens_total += total
+            else:
+                tokens_total += (step_tokens.get('input', 0) or 0) + (step_tokens.get('output', 0) or 0) + (step_tokens.get('reasoning', 0) or 0)
             tokens_in += step_tokens.get('input', 0) or 0
             tokens_out += step_tokens.get('output', 0) or 0
             tokens_reasoning += step_tokens.get('reasoning', 0) or 0
@@ -168,11 +190,17 @@ for raw in sys.stdin:
     elif t == 'error':
         err = ev.get('error', {})
         msg = ''
+        etype = ''
         if isinstance(err, dict):
-            data = err.get('data', {}) or {}
-            msg = data.get('message', '') if isinstance(data, dict) else str(err)
+            etype = err.get('type', '') or ''
+            msg = err.get('message', '') or ''
+            if not msg:
+                data = err.get('data', {}) or {}
+                msg = data.get('message', '') if isinstance(data, dict) else str(err)
         if not msg:
             msg = str(err)
+        if etype:
+            msg = f'{etype}: {msg}'
         print(f'  [ERROR]  {msg[:200]}', flush=True)
 
 print(f'Tool calls: {tool_calls}')

@@ -17,7 +17,8 @@ Available models (from `opencode models`):
 
 | Model | Notes |
 |-------|-------|
-| `opencode/deepseek-v4-flash-free` | Free, default — no API key needed |
+| `opencode/glm-5.3-flash-free` | Free, default — no API key needed |
+| `opencode/deepseek-v4.1-flash-free` | Free |
 | `opencode/big-pickle` | Free |
 | `opencode/nemotron-3-super-free` | Free |
 | `google/gemini-2.5-flash` | Requires `GOOGLE_GENERATIVE_AI_API_KEY` |
